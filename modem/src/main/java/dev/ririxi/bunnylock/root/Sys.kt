@@ -104,20 +104,37 @@ object Sys {
     // A refused launch prints a SecurityException, not an "Error" line.
     private val AM_START_FAILURE_MARKERS = listOf("Error", "Exception", "does not exist")
 
+        /** One UI 2+ receptor de keystrings para forzar el menú oculto de bandas de Samsung. */
+    private val SAMSUNG_MENUS =
+        listOf(
+            "com.samsung.android.app.telephonyui/.hiddennetworksetting.MainActivity",
+            "com.samsung.hiddennetworksetting/.MainActivity",
+        )
+
+    // A refused launch prints a SecurityException, not an "Error" line.
+    private val AM_START_FAILURE_MARKERS = listOf("Error", "Exception", "does not exist")
+
     fun openSamsungMenu(): JSONObject {
+        // En Android 10 (One UI 2), lanzamos el intent con la clave de seguridad por broadcast al receptor de Samsung
+        val broadcastResult = sh("am broadcast -a com.samsung.android.action.SECRET_CODE -d android_secret_code://2263")
+        if (!broadcastResult.contains("Security exception")) {
+            return JSONObject().put("started", "secret_code_broadcast_2263")
+        }
+
         val failures = ArrayList<String>()
         for (component in SAMSUNG_MENUS) {
             val output = sh("am start -n $component")
             if (AM_START_FAILURE_MARKERS.none { it in output }) return JSONObject().put("started", component)
             failures += failureLine(output)
         }
+        
+        // Como alternativa final para Android 10, forzamos el componente receptor de keystrings de la UI de telefonía
+        val fallback = sh("am start -n com.samsung.android.app.telephonyui/.netsettings.ui.keystringreceiver.KeyStringReceiver")
+        if (AM_START_FAILURE_MARKERS.none { it in fallback }) {
+            return JSONObject().put("started", "keystringreceiver")
+        }
+
         val denied = failures.firstOrNull { "Permission Denial" in it }
         check(denied === null) { "This phone only lets Samsung's own apps open its band menu, so it needs root ($denied)." }
         throw IllegalStateException(failures.joinToString(" / ").ifEmpty { "Couldn't find the Samsung band menu on this phone." })
     }
-
-    private fun failureLine(amStartOutput: String): String {
-        val lines = amStartOutput.lines().map { it.trim() }
-        return lines.firstOrNull { "Permission Denial" in it || it.startsWith("Error:") } ?: lines.lastOrNull { it.isNotEmpty() }.orEmpty()
-    }
-}
