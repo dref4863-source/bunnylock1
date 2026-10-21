@@ -183,9 +183,44 @@ object Aosp {
         vararg args: Any?,
     ): Long? = runCatching { (call(name, *args) as Number).toLong() }.getOrNull()?.takeIf { it >= 0 }
 
+    // --- SOPORTE PARA ANDROID 10 (SDK 29): Conversión entre RAF Bitmask y NetworkType ---
+    private fun rafToNetworkType(raf: Long): Int =
+        runCatching {
+            Class.forName("android.telephony.RadioAccessFamily")
+                .getMethod("getNetworkTypeFromRaf", Int::class.javaPrimitiveType)
+                .invoke(null, raf.toInt()) as Int
+        }.getOrElse {
+            val g = generations(raf)
+            when {
+                g == listOf(false, false, true, false) -> 11 // LTE_ONLY
+                g == listOf(false, true, true, false) -> 12 // LTE_WCDMA
+                g == listOf(true, true, true, false) -> 9 // LTE_GSM_WCDMA
+                g == listOf(false, true, false, false) -> 2 // WCDMA_ONLY
+                g == listOf(true, false, false, false) -> 1 // GSM_ONLY
+                g == listOf(true, true, false, false) -> 0 // WCDMA_PREF
+                else -> 9
+            }
+        }
+
+    private fun networkTypeToRaf(networkType: Int): Long? =
+        runCatching {
+            val raf = Class.forName("android.telephony.RadioAccessFamily")
+                .getMethod("getRafFromNetworkType", Int::class.javaPrimitiveType)
+                .invoke(null, networkType) as Int
+            raf.toLong().takeIf { it > 0 }
+        }.getOrNull()
+
+    /** Lee la máscara actual del módem en Android 11+ o usa getPreferredNetworkType en Android 10. */
+    private fun readModemMask(subId: Int): Long? =
+        readMask("getAllowedNetworkTypesBitmask", subId)
+            ?: runCatching {
+                val netType = (call("getPreferredNetworkType", subId) as Number).toInt()
+                if (netType >= 0) networkTypeToRaf(netType) else null
+            }.getOrNull()
+
     private fun maskText(mask: Long?): String = mask?.let { "0x%X".format(it) } ?: "unavailable"
 
-    private fun errorText(error: Throwable): String = "${error.javaClass.simpleName}: ${error.message}"
+    private fun errorText(error: Throwable): String = "${error.javaClass.simpleName}:${error.message}"
 
     /**
      * Which of 2G, 3G, 4G and 5G a mask allows. A modem reads a mask back without the network types it lacks
@@ -238,7 +273,7 @@ object Aosp {
                 }
             }
         val keptOff = GENERATION_NAMES.filter { name -> removedByReason.values.any { name in it } }
-        return "Android keeps ${andList(keptOff)} off for now: ${andList(causes)}."
+        return "Android keeps ${andList(keptOff)} off for now:${andList(causes)}."
     }
 
     private fun reasonMasksText(subId: Int): String {
@@ -248,7 +283,7 @@ object Aosp {
                 .mapIndexedNotNull { reason, label ->
                     readMask("getAllowedNetworkTypesForReason", subId, reason)?.let { "$label=${maskText(it)}" }
                 }
-        val modem = readMask("getAllowedNetworkTypesBitmask", subId)
+        val modem = readModemMask(subId)
         return (reasons + "modem=${maskText(modem)}").joinToString(", ")
     }
 
@@ -276,7 +311,7 @@ object Aosp {
     fun state(subId: Int): JSONObject {
         val json = JSONObject()
         val userAllowed = readMask("getAllowedNetworkTypesForReason", subId, REASON_USER)
-        val modemAllowed = readMask("getAllowedNetworkTypesBitmask", subId)
+        val modemAllowed = readModemMask(subId)
         val otherReasons = otherReasonMasks(subId)
         val heldBack =
             userAllowed !== null &&
@@ -321,7 +356,7 @@ object Aosp {
             }
         val registered = call("setNetworkSelectionModeManual", subId, operatorInfo, persist) as Boolean
         check(registered) {
-            "Couldn't register on ${numeric.take(3)} ${numeric.drop(3)}. The network may be out of range, or it may not allow this SIM."
+            "Couldn't register on ${numeric.take(3)}${numeric.drop(3)}. The network may be out of range, or it may not allow this SIM."
         }
         return JSONObject().put("plmn", numeric)
     }
@@ -335,10 +370,22 @@ object Aosp {
         subId: Int,
         mask: Long,
     ): Boolean =
-        if (hasMethod("setAllowedNetworkTypesForReason", 3)) {
-            call("setAllowedNetworkTypesForReason", subId, REASON_USER, mask) as Boolean
-        } else {
-            call("setAllowedNetworkTypes", subId, mask) as Boolean
+        when {
+            hasMethod("setAllowedNetworkTypesForReason", 3) -> {
+                call("setAllowedNetworkTypesForReason", subId, REASON_USER, mask) as Boolean
+            }
+            hasMethod("setAllowedNetworkTypes", 2) -> {
+                call("setAllowedNetworkTypes", subId, mask) as Boolean
+            }
+            hasMethod("setPreferredNetworkType", 2) -> {
+                val netType = rafToNetworkType(mask)
+                runCatching {
+                    Sys.sh("settings put global preferred_network_mode$subId$netType")
+                    Sys.sh("settings put global preferred_network_mode $netType")
+                }
+                call("setPreferredNetworkType", subId, netType) as Boolean
+            }
+            else -> throw NoSuchMethodException("This Android version doesn't offer a network type setter.")
         }
 
     /**
@@ -351,7 +398,7 @@ object Aosp {
         slot: Int,
     ): JSONObject {
         val before = networkModeDiagnostic(subId, slot)
-        val previous = readMask("getAllowedNetworkTypesForReason", subId, REASON_USER) ?: readMask("getAllowedNetworkTypesBitmask", subId)
+        val previous = readMask("getAllowedNetworkTypesForReason", subId, REASON_USER) ?: readModemMask(subId)
         val supported = readMask("getRadioAccessFamily", slot, callingPackage)?.takeIf { it > 0 }
         val attempts =
             listOfNotNull(mask, mask and CDMA_BITS.inv(), supported?.let { mask and it })
@@ -368,7 +415,7 @@ object Aosp {
             val failure =
                 when {
                     error !== null -> errorText(error)
-                    accepted -> "reported success, but modem readback is ${maskText(readMask("getAllowedNetworkTypesBitmask", subId))}"
+                    accepted -> "reported success, but modem readback is ${maskText(readModemMask(subId))}"
                     else -> "refused"
                 }
             failures += "mask 0x%X %s".format(attempt, failure)
@@ -422,7 +469,7 @@ object Aosp {
         otherReasons: Map<Int, Long>,
     ): JSONObject {
         val json = JSONObject().put("allowed", attempt).put("requested", requested)
-        val readback = readMask("getAllowedNetworkTypesBitmask", subId)
+        val readback = readModemMask(subId)
         if (readback !== null && generations(readback) != generations(attempt)) heldBackCause(attempt, otherReasons)?.let { json.put("heldBack", it) }
         return json
     }
@@ -435,7 +482,7 @@ object Aosp {
         val expected = listOfNotNull(mask, sentToModem(mask, otherReasons).takeIf(::hasAnyGeneration)).map(::generations)
         repeat(MODE_READBACK_CHECKS) { check ->
             if (check > 0) Thread.sleep(MODE_READBACK_RETRY_MS)
-            val readback = readMask("getAllowedNetworkTypesBitmask", subId)
+            val readback = readModemMask(subId)
             if (readback === null || generations(readback) in expected) return true
         }
         return false
@@ -480,7 +527,7 @@ object Aosp {
         for (specifiers in listOf(whole, split).distinctBy { it.size }) {
             val shape = if (specifiers === whole) "as sent" else "split into ${specifiers.size} specifiers"
             val (answer, callbackDiagnostic) = requestChannels(subId, specifiers, requestDiagnostic)
-            outcomes += "$shape: $callbackDiagnostic"
+            outcomes += "$shape:$callbackDiagnostic"
             if (answer == true) {
                 return JSONObject()
                     .put("result", true)
@@ -498,11 +545,11 @@ object Aosp {
         val fewer = "Selecting $MAX_RIL_BANDS or fewer bands may work on this phone."
         val failure =
             when {
-                split.size > whole.size -> "$rejected, also with the bands split into groups of $MAX_RIL_BANDS. $fewer"
-                whole.any { it.bands.size > MAX_RIL_BANDS } -> "$rejected. $fewer"
+                split.size > whole.size -> "$rejected, also with the bands split into groups of $MAX_RIL_BANDS.$fewer"
+                whole.any { it.bands.size > MAX_RIL_BANDS } -> "$rejected.$fewer"
                 else -> "$rejected."
             }
-        throw IllegalStateException("$failure $requestDiagnostic; ${outcomes.joinToString("; ")}; after=${channelState(subId)}")
+        throw IllegalStateException("$failure$requestDiagnostic; ${outcomes.joinToString("; ")}; after=${channelState(subId)}")
     }
 
     private fun toSpecifier(spec: JSONObject): RadioAccessSpecifier =
@@ -600,8 +647,8 @@ object Aosp {
         }
         val callbackReceived = latch.await(CHANNELS_CALLBACK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
         val elapsedMs = (System.nanoTime() - started) / 1_000_000
-        val callbackDiagnostic = if (callbackReceived) "callback=$result via $callbackPath" else "callback timed out"
-        return result to "$callbackDiagnostic after ${elapsedMs}ms"
+        val callbackDiagnostic = if (callbackReceived) "callback=$result via$callbackPath" else "callback timed out"
+        return result to "$callbackDiagnostic after${elapsedMs}ms"
     }
 
     private fun channelState(subId: Int): String = runCatching { specsToJson(readChannels(subId)).toString() }.getOrElse(::errorText)
