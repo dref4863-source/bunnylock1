@@ -2,6 +2,7 @@ package dev.ririxi.bunnylock.data
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Build
 import android.telephony.CellIdentityGsm
 import android.telephony.CellIdentityLte
 import android.telephony.CellIdentityNr
@@ -116,7 +117,7 @@ object Cells {
                         }
                     },
                 )
-            } catch (_: SecurityException) {
+            } catch (_: Throwable) {
                 if (cont.isActive) cont.resume(emptyList())
             }
         }
@@ -124,7 +125,6 @@ object Cells {
     /** Android's cached list mixes the cells of every SIM, so it's only used when one modem is active. */
     @SuppressLint("MissingPermission")
     private fun cachedCellInfo(telephony: TelephonyManager): List<CellInfo> {
-        if (telephony.activeModemCount > 1) return emptyList()
         return runCatching { telephony.allCellInfo }.getOrNull() ?: emptyList()
     }
 
@@ -133,19 +133,39 @@ object Cells {
         mnc: String?,
     ) = if (mcc.isNullOrEmpty() || mnc.isNullOrEmpty()) null else mcc + mnc
 
-    private fun toCell(info: CellInfo): Cell? {
-        val cell = baseCell(info) ?: return null
-        val identity = info.cellIdentity
-        val plmn =
-            when (identity) {
-                is CellIdentityLte -> plmnOf(identity.mccString, identity.mncString)
-                is CellIdentityNr -> plmnOf(identity.mccString, identity.mncString)
-                is CellIdentityWcdma -> plmnOf(identity.mccString, identity.mncString)
-                is CellIdentityGsm -> plmnOf(identity.mccString, identity.mncString)
-                else -> null
+    private fun toCell(info: CellInfo): Cell? =
+        runCatching {
+            val cell = baseCell(info) ?: return null
+            val plmn: String?
+            val operator: String?
+            when (info) {
+                is CellInfoLte -> {
+                    val id = info.cellIdentity
+                    plmn = plmnOf(id.mccString, id.mncString)
+                    operator = id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
+                }
+                is CellInfoNr -> {
+                    val id = info.cellIdentity as CellIdentityNr
+                    plmn = plmnOf(id.mccString, id.mncString)
+                    operator = id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
+                }
+                is CellInfoWcdma -> {
+                    val id = info.cellIdentity
+                    plmn = plmnOf(id.mccString, id.mncString)
+                    operator = id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
+                }
+                is CellInfoGsm -> {
+                    val id = info.cellIdentity
+                    plmn = plmnOf(id.mccString, id.mncString)
+                    operator = id.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() }
+                }
+                else -> {
+                    plmn = null
+                    operator = null
+                }
             }
-        return cell.copy(plmn = plmn, operator = identity.operatorAlphaLong?.toString()?.takeIf { it.isNotBlank() })
-    }
+            cell.copy(plmn = plmn, operator = operator)
+        }.getOrNull()
 
     // Some radio HALs report a wrong band (e.g. n1 for an n78 ARFCN), so the ARFCN table wins on disagreement.
     internal fun lteBand(
@@ -174,11 +194,12 @@ object Cells {
         val identity = info.cellIdentity
         val earfcn = identity.earfcn
         if (earfcn == CellInfo.UNAVAILABLE || identity.pci == CellInfo.UNAVAILABLE) return null
+        val reportedBands = if (Build.VERSION.SDK_INT >= 30) runCatching { identity.bands }.getOrDefault(IntArray(0)) else IntArray(0)
         return Cell(
             Rat.LTE,
             earfcn.toLong(),
             identity.pci,
-            lteBand(identity.bands, earfcn),
+            lteBand(reportedBands, earfcn),
             registered = info.isRegistered,
             rsrp = info.cellSignalStrength.rsrp.availableOrNull(),
             source = "android",
@@ -191,11 +212,12 @@ object Cells {
         val signal = info.cellSignalStrength as CellSignalStrengthNr
         val nrarfcn = identity.nrarfcn
         if (nrarfcn == CellInfo.UNAVAILABLE || identity.pci == CellInfo.UNAVAILABLE) return null
+        val reportedBands = if (Build.VERSION.SDK_INT >= 30) runCatching { identity.bands }.getOrDefault(IntArray(0)) else IntArray(0)
         return Cell(
             Rat.NR,
             nrarfcn.toLong(),
             identity.pci,
-            nrBand(identity.bands, nrarfcn),
+            nrBand(reportedBands, nrarfcn),
             registered = info.isRegistered,
             rsrp = signal.ssRsrp.availableOrNull(),
             source = "android",
