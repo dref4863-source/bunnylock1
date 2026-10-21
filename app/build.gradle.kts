@@ -22,7 +22,7 @@ android {
 
     defaultConfig {
         applicationId = "dev.ririxi.bunnylock"
-        minSdk = 30
+        minSdk = 29
         targetSdk = 37
         versionCode = 1
         versionName = "1.3.1"
