@@ -9,9 +9,7 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 
-/** System properties and shell commands, and what they reveal about the phone's modem. */
 object Sys {
-    // A command's children can keep its output open after it has ended or been killed. They only get this long.
     private const val OUTPUT_DRAIN_MS = 1000L
 
     fun prop(key: String): String =
@@ -19,14 +17,12 @@ object Sys {
             Class.forName("android.os.SystemProperties").getMethod("get", String::class.java).invoke(null, key) as String
         }.getOrDefault("")
 
-    /** Runs a shell command and returns what it printed. A command still running after [timeoutSec] is killed. */
     fun sh(
         command: String,
         timeoutSec: Long = 15,
     ): String {
         val process = ProcessBuilder("/system/bin/sh", "-c", command).redirectErrorStream(true).start()
         val output = ByteArrayOutputStream()
-        // Reading on this thread would wait for the command to close its output, so the timeout could never cut in.
         val reader = thread(name = "bunny-sh", isDaemon = true) { runCatching { process.inputStream.copyTo(output) } }
         if (!process.waitFor(timeoutSec, TimeUnit.SECONDS)) process.destroyForcibly()
         reader.join(OUTPUT_DRAIN_MS)
@@ -79,7 +75,6 @@ object Sys {
             .put("mtkOemHookChecked", JSONArray(runCatching { OemHook.diagnostics() }.getOrDefault(emptyList())))
     }
 
-    /** [qrtr] settles it: a modem that answers QMI over QRTR is Qualcomm's, whatever the properties say. [hints] is lowercase. */
     private fun chipsetVendor(
         qrtr: Boolean,
         socManufacturer: String,
@@ -94,28 +89,15 @@ object Sys {
             else -> "unknown"
         }
 
-    /** One UI 6+ first, then the older standalone package. Root only. */
     private val SAMSUNG_MENUS =
         listOf(
             "com.samsung.android.app.telephonyui/.hiddennetworksetting.MainActivity",
             "com.samsung.hiddennetworksetting/.MainActivity",
         )
 
-    // A refused launch prints a SecurityException, not an "Error" line.
-    private val AM_START_FAILURE_MARKERS = listOf("Error", "Exception", "does not exist")
-
-        /** One UI 2+ receptor de keystrings para forzar el menú oculto de bandas de Samsung. */
-    private val SAMSUNG_MENUS =
-        listOf(
-            "com.samsung.android.app.telephonyui/.hiddennetworksetting.MainActivity",
-            "com.samsung.hiddennetworksetting/.MainActivity",
-        )
-
-    // A refused launch prints a SecurityException, not an "Error" line.
     private val AM_START_FAILURE_MARKERS = listOf("Error", "Exception", "does not exist")
 
     fun openSamsungMenu(): JSONObject {
-        // En Android 10 (One UI 2), lanzamos el intent con la clave de seguridad por broadcast al receptor de Samsung
         val broadcastResult = sh("am broadcast -a com.samsung.android.action.SECRET_CODE -d android_secret_code://2263")
         if (!broadcastResult.contains("Security exception")) {
             return JSONObject().put("started", "secret_code_broadcast_2263")
@@ -127,8 +109,7 @@ object Sys {
             if (AM_START_FAILURE_MARKERS.none { it in output }) return JSONObject().put("started", component)
             failures += failureLine(output)
         }
-        
-        // Como alternativa final para Android 10, forzamos el componente receptor de keystrings de la UI de telefonía
+
         val fallback = sh("am start -n com.samsung.android.app.telephonyui/.netsettings.ui.keystringreceiver.KeyStringReceiver")
         if (AM_START_FAILURE_MARKERS.none { it in fallback }) {
             return JSONObject().put("started", "keystringreceiver")
@@ -138,3 +119,9 @@ object Sys {
         check(denied === null) { "This phone only lets Samsung's own apps open its band menu, so it needs root ($denied)." }
         throw IllegalStateException(failures.joinToString(" / ").ifEmpty { "Couldn't find the Samsung band menu on this phone." })
     }
+
+    private fun failureLine(amStartOutput: String): String {
+        val lines = amStartOutput.lines().map { it.trim() }
+        return lines.firstOrNull { "Permission Denial" in it || it.startsWith("Error:") } ?: lines.lastOrNull { it.isNotEmpty() }.orEmpty()
+    }
+}
